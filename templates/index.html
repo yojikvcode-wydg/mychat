@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Мой чат</title>
+
+    <link rel="icon" type="image/png" href="/favicon/favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="/favicon/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/favicon/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="MyWebSite" />
+    <link rel="manifest" href="/favicon/site.webmanifest" />
+
+  <link rel="stylesheet" href="/static/style.css">
+
+</head>
+<body>
+  <div class="sidebar">
+    <div class="top-bar">
+      <span>👤 {{ username }}</span>
+      <a href="/logout" class="logout-btn">Выйти</a>
+    </div>
+    <h4>Пользователи</h4>
+    <ul id="users-list"></ul>
+  </div>
+
+  <div class="chat-container">
+    <div id="chat-header">
+      <h3 id="chat-with">Выберите пользователя для чата</h3>
+    </div>
+    <div id="chat-messages"></div>
+    <div class="composer">
+      <input id="input" autocomplete="off" placeholder="Напишите сообщение..." />
+      <button id="sendBtn">Отправить</button>
+    </div>
+  </div>
+
+  <!-- Передаём username в статический JS -->
+  <script>
+    // безопасно: username приходит из Jinja
+    window.CURRENT_USERNAME = "{{ username }}";
+  </script>
+
+  <!-- Скрипт чата -->
+  <script src="/static/chat.js"></script>
+</body>
+</html>
