@@ -2,36 +2,95 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <title>Мой чат</title>
 
     <link rel="icon" type="image/png" href="/favicon/favicon-96x96.png" sizes="96x96" />
     <link rel="icon" type="image/svg+xml" href="/favicon/favicon.svg" />
     <link rel="shortcut icon" href="/favicon/favicon.ico" />
     <link rel="apple-touch-icon" sizes="180x180" href="/favicon/apple-touch-icon.png" />
-    <meta name="apple-mobile-web-app-title" content="MyWebSite" />
+    <meta name="apple-mobile-web-app-title" content="MyChat" />
     <link rel="manifest" href="/favicon/site.webmanifest" />
 
   <link rel="stylesheet" href="/static/style.css">
 
 </head>
 <body>
-  <div class="sidebar">
+  <!-- Mobile menu overlay -->
+  <div class="mobile-overlay" id="mobileOverlay"></div>
+  
+  <!-- Mobile menu button -->
+  <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Меню">
+    <span></span>
+    <span></span>
+    <span></span>
+  </button>
+
+  <div class="sidebar" id="sidebar">
     <div class="top-bar">
-      <span>👤 {{ username }}</span>
+      <span class="user-info">👤 {{ username }}</span>
       <a href="/logout" class="logout-btn">Выйти</a>
     </div>
     <h4>Пользователи</h4>
     <ul id="users-list"></ul>
+    
+    <div class="rooms-section">
+      <div class="rooms-header">
+        <h4>Комнаты</h4>
+        <button class="create-room-btn" id="createRoomBtn" title="Создать комнату">+</button>
+      </div>
+      <ul id="rooms-list"></ul>
+    </div>
+  </div>
+  
+  <!-- Room Creation Modal -->
+  <div class="modal-overlay" id="roomModalOverlay">
+    <div class="modal" id="roomModal">
+      <h3>Создать комнату</h3>
+      <form id="createRoomForm">
+        <input type="text" id="roomName" placeholder="Название комнаты" required>
+        <textarea id="roomDescription" placeholder="Описание (необязательно)" rows="3"></textarea>
+        <div class="modal-buttons">
+          <button type="submit" class="btn-primary">Создать</button>
+          <button type="button" class="btn-secondary" id="cancelRoomBtn">Отмена</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  
+  <!-- Room Management Modal -->
+  <div class="modal-overlay" id="roomManageModalOverlay">
+    <div class="modal" id="roomManageModal">
+      <h3 id="roomManageTitle">Управление комнатой</h3>
+      <div id="roomManageContent"></div>
+      <div class="modal-buttons">
+        <button type="button" class="btn-secondary" id="closeRoomManageBtn">Закрыть</button>
+      </div>
+    </div>
   </div>
 
   <div class="chat-container">
     <div id="chat-header">
-      <h3 id="chat-with">Выберите пользователя для чата</h3>
+      <button class="mobile-back-btn" id="mobileBackBtn" aria-label="Назад к списку">←</button>
+      <div class="chat-header-content">
+        <h3 id="chat-with">Выберите пользователя для чата</h3>
+        <div class="room-description" style="display: none;"></div>
+      </div>
     </div>
     <div id="chat-messages"></div>
+    <div class="reply-indicator" id="replyIndicator" style="display: none;">
+      <div class="reply-indicator-content">
+        <span class="reply-indicator-text">Reply to <strong id="replyToUser"></strong>:</span>
+        <span class="reply-indicator-quote" id="replyToQuote"></span>
+      </div>
+      <button class="reply-indicator-close" id="replyIndicatorClose" aria-label="Cancel reply">×</button>
+    </div>
     <div class="composer">
       <input id="input" autocomplete="off" placeholder="Напишите сообщение..." />
-      <button id="sendBtn">Отправить</button>
+      <button id="sendBtn" aria-label="Отправить">Отправить</button>
     </div>
   </div>
 

@@ -7,6 +7,7 @@ from datetime import datetime
 import uuid
 import asyncio
 import base64
+import json
 from passlib.context import CryptContext
 
 app = FastAPI()
@@ -16,6 +17,7 @@ templates = Jinja2Templates(directory="templates")
 # -------------------- DB --------------------
 USERS_DB = "users.db"
 CHAT_DB = "chathistory.db"
+ROOMS_DB = "rooms.db"
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
@@ -50,13 +52,55 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # rooms.db - Rooms and room messages
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    # Rooms table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rooms (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            creator_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    # Room members table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS room_members (
+            room_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (room_id, user_id),
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+        )
+    """)
+    # Room messages table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS room_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            sender_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            reply_to_sender_id TEXT,
+            reply_to_sender_name TEXT,
+            reply_to_text TEXT,
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    conn.close()
+
 # -------------------- Users SQLite --------------------
 def add_user(user_id, name, password_hash):
     conn = sqlite3.connect(USERS_DB)
     c = conn.cursor()
     try:
+        # New users start as offline - will be set online when global WS connects
         c.execute("INSERT OR IGNORE INTO users(id, name, password_hash, online) VALUES (?, ?, ?, ?)",
-                  (user_id, name, password_hash, 1))
+                  (user_id, name, password_hash, 0))
         conn.commit()
     finally:
         conn.close()
@@ -127,8 +171,25 @@ def decode_cookie_safe(value: str | None) -> str | None:
 connections = {}  # {user_id: {target_id: websocket}}
 user_status_connections = set()  # WS для обновления статусов
 global_connections = {}  # {user_id: websocket}
+room_connections = {}  # {room_id: {user_id: websocket}}
 
 async def broadcast_user_status():
+    # Update status based on actual connections
+    # Users with active global_connections are online
+    all_users = get_all_users()
+    # Create a set of actually connected user IDs
+    connected_user_ids = set(global_connections.keys())
+    
+    # Update database to reflect actual connection state
+    for user in all_users:
+        user_id = user["id"]
+        is_actually_online = user_id in connected_user_ids
+        # Only update if status differs to avoid unnecessary DB writes
+        if bool(user["online"]) != is_actually_online:
+            set_user_online(user_id, is_actually_online)
+            user["online"] = is_actually_online
+    
+    # Broadcast updated status to all status WebSocket clients
     users_list = get_all_users()
     for ws in list(user_status_connections):
         try:
@@ -151,19 +212,89 @@ async def user_status_ws(websocket: WebSocket):
 async def global_ws(websocket: WebSocket, user_id: str):
     await websocket.accept()
     # запоминаем глобальное соединение (один ws на пользователя)
+    # If there's already a connection for this user, close it first
+    if user_id in global_connections:
+        try:
+            old_ws = global_connections[user_id]
+            await old_ws.close()
+        except Exception:
+            pass
+        del global_connections[user_id]
+    
     global_connections[user_id] = websocket
+    # Set user as online when they establish global connection
+    set_user_online(user_id, True)
+    await broadcast_user_status()
+    
     try:
         while True:
-            # держим соединение живым
-            await asyncio.sleep(10)
+            # Wait for messages from client (ping/pong or notifications)
+            # Use receive_text with timeout to keep connection alive
+            try:
+                # Wait for any message with a timeout
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                # If we receive a message, process it
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type") == "pong":
+                        # Client responded to ping, connection is alive
+                        continue
+                except Exception:
+                    # Not JSON or other error, ignore
+                    pass
+            except asyncio.TimeoutError:
+                # Timeout - send ping to check if connection is alive
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception as e:
+                    # Connection is dead, break the loop
+                    print(f"[WS GLOBAL] Ping failed for {user_id}: {e}")
+                    break
+            except WebSocketDisconnect:
+                # Normal disconnect
+                break
+            except Exception as e:
+                # Other error, log and break
+                print(f"[WS GLOBAL] Error for {user_id}: {e}")
+                break
     except WebSocketDisconnect:
-        if user_id in global_connections:
+        pass
+    except Exception as e:
+        print(f"[WS GLOBAL] Unexpected error for {user_id}: {e}")
+    finally:
+        # Clean up: remove from connections and set offline
+        if user_id in global_connections and global_connections[user_id] == websocket:
             del global_connections[user_id]
+        # Set user as offline when they disconnect
+        set_user_online(user_id, False)
+        await broadcast_user_status()
+
+# -------------------- Periodic Cleanup --------------------
+async def periodic_connection_cleanup():
+    """Periodically check and clean up dead connections"""
+    # Note: This cleanup is now minimal - the global_ws handler manages its own lifecycle
+    # We only check for connections that might have been left in the dict due to errors
+    while True:
+        await asyncio.sleep(120)  # Check every 2 minutes (less aggressive)
+        # The global_ws handler already manages connection health with pings
+        # We don't need to ping here - that would interfere with the handler
+        # This cleanup is just a safety net for edge cases
+        pass  # Removed aggressive ping checking - let global_ws handle it
 
 # -------------------- Startup --------------------
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     init_db()
+    # Set all users offline on startup (they'll be set online when they connect)
+    conn = sqlite3.connect(USERS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("UPDATE users SET online=0")
+        conn.commit()
+    finally:
+        conn.close()
+    # Start periodic cleanup task
+    asyncio.create_task(periodic_connection_cleanup())
 
 # -------------------- Routes --------------------
 @app.get("/", response_class=HTMLResponse)
@@ -186,6 +317,7 @@ async def register(username: str = Form(...), password: str = Form(...)):
 
     user_id = str(uuid.uuid4())
     password_hash = hash_password(password)
+    # New users start as offline - will be set online when global WS connects
     add_user(user_id, username, password_hash)
 
     response = RedirectResponse("/index", status_code=303)
@@ -200,11 +332,12 @@ async def login(username: str = Form(...), password: str = Form(...)):
     if not user or not verify_password(password, user.get("password_hash", "")):
         return RedirectResponse("/", status_code=303)
 
-    set_user_online(user["id"], True)
+    # Don't set online here - wait for global WebSocket connection
+    # The status will be set when /ws/global/{user_id} connects
     response = RedirectResponse("/index", status_code=303)
     response.set_cookie("user_id", user["id"])
     response.set_cookie("username", encode_cookie(username))
-    await broadcast_user_status()
+    # Status will be updated when global WS connects
     return response
 
 @app.get("/logout")
@@ -290,23 +423,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, target_id: str)
                 except Exception as e:
                     print(f"[WARN] failed to notify global_connections[{target_id}]: {e}")
 
-            # отправляем получателю (всем его WS), если есть
-            if target_id in connections:
-                # отправляем всем WS, которые зарегистрированы для target_id
-                # (connections[target_id] — dict target->ws, т.е. это все ws, где user==target)
-                for other_target, ws in list(connections[target_id].items()):
+            # отправляем получателю - только в его приватный чат с отправителем
+            # connections[target_id][user_id] - это WS где target_id чатит с user_id
+            if target_id in connections and user_id in connections[target_id]:
+                try:
+                    ws = connections[target_id][user_id]
+                    await ws.send_json(message_data)
+                except Exception as e:
+                    print(f"[WARN] send to connections[{target_id}][{user_id}] failed: {e}")
+                    # при ошибке — удаляем это ws
                     try:
-                        await ws.send_json(message_data)
-                    except Exception as e:
-                        print(f"[WARN] send to connections[{target_id}][{other_target}] failed: {e}")
-                        # при ошибке — удаляем это ws
-                        try:
-                            del connections[target_id][other_target]
-                        except Exception:
-                            pass
-                # если словарь пользователя пуст — удалим его
-                if not connections[target_id]:
-                    del connections[target_id]
+                        del connections[target_id][user_id]
+                        if not connections[target_id]:
+                            del connections[target_id]
+                    except Exception:
+                        pass
 
             # эхо для отправителя (чтобы он увидел своё сообщение)
             try:
@@ -420,3 +551,447 @@ async def api_mark_read(user_id: str, target_id: str):
             pass
 
     return {"status": "ok"}
+
+# -------------------- Rooms Management --------------------
+def create_room(room_id: str, name: str, description: str, creator_id: str):
+    """Create a new room"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        created_at = datetime.now().isoformat()
+        c.execute("""
+            INSERT INTO rooms (id, name, description, creator_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (room_id, name, description, creator_id, created_at))
+        # Add creator as member
+        c.execute("""
+            INSERT INTO room_members (room_id, user_id, added_at)
+            VALUES (?, ?, ?)
+        """, (room_id, creator_id, created_at))
+        conn.commit()
+    finally:
+        conn.close()
+
+def delete_room(room_id: str, user_id: str):
+    """Delete a room (only by creator)"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        # Check if user is creator
+        c.execute("SELECT creator_id FROM rooms WHERE id=?", (room_id,))
+        row = c.fetchone()
+        if not row or row[0] != user_id:
+            return False
+        # Delete room (cascade will delete members and messages)
+        c.execute("DELETE FROM rooms WHERE id=?", (room_id,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def get_room(room_id: str):
+    """Get room info"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT id, name, description, creator_id, created_at
+            FROM rooms WHERE id=?
+        """, (room_id,))
+        row = c.fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1],
+                "description": row[2],
+                "creator_id": row[3],
+                "created_at": row[4]
+            }
+    finally:
+        conn.close()
+    return None
+
+def get_user_rooms(user_id: str):
+    """Get all rooms user is a member of"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT r.id, r.name, r.description, r.creator_id, r.created_at,
+                   COUNT(rm.user_id) as member_count
+            FROM rooms r
+            INNER JOIN room_members rm ON r.id = rm.room_id
+            WHERE rm.user_id = ?
+            GROUP BY r.id
+            ORDER BY r.created_at DESC
+        """, (user_id,))
+        rooms = []
+        for row in c.fetchall():
+            creator = get_user_by_id(row[3])
+            rooms.append({
+                "id": row[0],
+                "name": row[1],
+                "description": row[2],
+                "creator_id": row[3],
+                "creator_name": creator["name"] if creator else "Unknown",
+                "member_count": row[5],
+                "created_at": row[4]
+            })
+    finally:
+        conn.close()
+    return rooms
+
+def add_user_to_room(room_id: str, user_id: str, adder_id: str):
+    """Add user to room (only by creator)"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        # Check if adder is creator
+        c.execute("SELECT creator_id FROM rooms WHERE id=?", (room_id,))
+        row = c.fetchone()
+        if not row or row[0] != adder_id:
+            return False
+        # Check if user is already member
+        c.execute("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?", (room_id, user_id))
+        if c.fetchone():
+            return True  # Already member
+        # Add user
+        added_at = datetime.now().isoformat()
+        c.execute("""
+            INSERT INTO room_members (room_id, user_id, added_at)
+            VALUES (?, ?, ?)
+        """, (room_id, user_id, added_at))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def remove_user_from_room(room_id: str, user_id: str, remover_id: str):
+    """Remove user from room (only by creator, can't remove creator)"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        # Check if remover is creator
+        c.execute("SELECT creator_id FROM rooms WHERE id=?", (room_id,))
+        row = c.fetchone()
+        if not row or row[0] != remover_id:
+            return False
+        # Can't remove creator
+        if user_id == row[0]:
+            return False
+        # Remove user
+        c.execute("DELETE FROM room_members WHERE room_id=? AND user_id=?", (room_id, user_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def get_room_members(room_id: str):
+    """Get all members of a room"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT user_id FROM room_members WHERE room_id = ?
+        """, (room_id,))
+        member_ids = [row[0] for row in c.fetchall()]
+        # Get user names from users database
+        members = []
+        for user_id in member_ids:
+            user = get_user_by_id(user_id)
+            if user:
+                members.append({"id": user_id, "name": user["name"]})
+    finally:
+        conn.close()
+    return members
+
+def is_room_member(room_id: str, user_id: str):
+    """Check if user is member of room"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?", (room_id, user_id))
+        return c.fetchone() is not None
+    finally:
+        conn.close()
+
+def save_room_message(room_id: str, sender_id: str, sender_name: str, text: str,
+                     reply_to_sender_id: str = None, reply_to_sender_name: str = None,
+                     reply_to_text: str = None):
+    """Save message to room"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        timestamp = datetime.now().strftime("%H:%M")
+        c.execute("""
+            INSERT INTO room_messages (room_id, sender_id, sender_name, text, timestamp,
+                                     reply_to_sender_id, reply_to_sender_name, reply_to_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (room_id, sender_id, sender_name, text, timestamp,
+              reply_to_sender_id, reply_to_sender_name, reply_to_text))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_room_history(room_id: str):
+    """Get room message history"""
+    conn = sqlite3.connect(ROOMS_DB)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT sender_name, text, timestamp, sender_id,
+                   reply_to_sender_id, reply_to_sender_name, reply_to_text
+            FROM room_messages
+            WHERE room_id = ?
+            ORDER BY id ASC
+        """, (room_id,))
+        messages = []
+        for row in c.fetchall():
+            msg = {
+                "user": row[0],
+                "text": row[1],
+                "time": row[2],
+                "sender_id": row[3]
+            }
+            if row[4]:  # reply_to_sender_id
+                msg["reply_to"] = {
+                    "sender_id": row[4],
+                    "sender_name": row[5],
+                    "text": row[6]
+                }
+            messages.append(msg)
+    finally:
+        conn.close()
+    return messages
+
+# -------------------- Rooms API --------------------
+@app.post("/api/rooms/create")
+async def api_create_room(request: Request):
+    """Create a new room"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    data = await request.json()
+    name = data.get("name", "").strip()
+    description = data.get("description", "").strip()
+    
+    if not name:
+        return JSONResponse({"error": "Room name required"}, status_code=400)
+    
+    room_id = str(uuid.uuid4())
+    create_room(room_id, name, description, user_id)
+    
+    room = get_room(room_id)
+    creator = get_user_by_id(user_id)
+    return {
+        "id": room["id"],
+        "name": room["name"],
+        "description": room["description"],
+        "creator_id": room["creator_id"],
+        "creator_name": creator["name"] if creator else "Unknown",
+        "member_count": 1
+    }
+
+@app.delete("/api/rooms/{room_id}")
+async def api_delete_room(request: Request, room_id: str):
+    """Delete a room"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    if delete_room(room_id, user_id):
+        return {"status": "ok"}
+    return JSONResponse({"error": "Not authorized or room not found"}, status_code=403)
+
+@app.get("/api/rooms")
+async def api_get_rooms(request: Request):
+    """Get all rooms for current user"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    rooms = get_user_rooms(user_id)
+    return rooms
+
+@app.post("/api/rooms/{room_id}/add_user")
+async def api_add_user_to_room(request: Request, room_id: str):
+    """Add user to room"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    data = await request.json()
+    target_user_id = data.get("user_id")
+    
+    if not target_user_id:
+        return JSONResponse({"error": "user_id required"}, status_code=400)
+    
+    if add_user_to_room(room_id, target_user_id, user_id):
+        return {"status": "ok"}
+    return JSONResponse({"error": "Not authorized"}, status_code=403)
+
+@app.post("/api/rooms/{room_id}/remove_user")
+async def api_remove_user_from_room(request: Request, room_id: str):
+    """Remove user from room"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    data = await request.json()
+    target_user_id = data.get("user_id")
+    
+    if not target_user_id:
+        return JSONResponse({"error": "user_id required"}, status_code=400)
+    
+    if remove_user_from_room(room_id, target_user_id, user_id):
+        return {"status": "ok"}
+    return JSONResponse({"error": "Not authorized"}, status_code=403)
+
+@app.get("/api/rooms/{room_id}/members")
+async def api_get_room_members(request: Request, room_id: str):
+    """Get room members"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    if not is_room_member(room_id, user_id):
+        return JSONResponse({"error": "Not a member"}, status_code=403)
+    
+    members = get_room_members(room_id)
+    return members
+
+@app.get("/api/rooms/{room_id}/history")
+async def api_get_room_history(request: Request, room_id: str):
+    """Get room message history"""
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    if not is_room_member(room_id, user_id):
+        return JSONResponse({"error": "Not a member"}, status_code=403)
+    
+    messages = get_room_history(room_id)
+    return messages
+
+# -------------------- Room WebSocket --------------------
+@app.websocket("/ws/room/{room_id}/{user_id}")
+async def room_websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
+    """WebSocket endpoint for room chat"""
+    await websocket.accept()
+    
+    # Check if user is member
+    if not is_room_member(room_id, user_id):
+        await websocket.close(code=1008, reason="Not a member")
+        return
+    
+    # Add to room connections
+    if room_id not in room_connections:
+        room_connections[room_id] = {}
+    room_connections[room_id][user_id] = websocket
+    
+    sender_info = get_user_by_id(user_id)
+    sender_name = sender_info["name"] if sender_info else user_id
+    
+    print(f"[ROOM WS CONNECT] {user_id} -> room {room_id}")
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            print(f"[ROOM WS RECV] from {user_id} in room {room_id}: {data}")
+            
+            # Parse message data (could be JSON with reply info)
+            text = data
+            reply_to = None
+            try:
+                msg_data = json.loads(data)
+                # Check if it's actually a JSON object with our structure
+                if isinstance(msg_data, dict) and "text" in msg_data:
+                    text = msg_data.get("text", data)
+                    reply_to = msg_data.get("reply_to")
+                else:
+                    # JSON but not our format - treat as plain text
+                    text = data
+                    reply_to = None
+            except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
+                # Plain text message - use data as-is
+                text = data
+                reply_to = None
+            
+            timestamp = datetime.now().strftime("%H:%M")
+            
+            # Extract reply information
+            reply_to_sender_id = None
+            reply_to_sender_name = None
+            reply_to_text = None
+            
+            if reply_to:
+                reply_to_sender_id = reply_to.get("sender_id")
+                reply_to_sender_name = reply_to.get("sender_name")
+                reply_to_text = reply_to.get("text")
+            
+            # Save message to database
+            save_room_message(room_id, user_id, sender_name, text,
+                            reply_to_sender_id, reply_to_sender_name, reply_to_text)
+            
+            # Prepare message data with sender info
+            message_data = {
+                "user": sender_name,
+                "text": text,
+                "time": timestamp,
+                "sender_id": user_id,
+                "room_id": room_id
+            }
+            
+            # Add reply info if present
+            if reply_to:
+                message_data["reply_to"] = {
+                    "sender_id": reply_to_sender_id,
+                    "sender_name": reply_to_sender_name,
+                    "text": reply_to_text
+                }
+            
+            # Broadcast to all room members
+            for member_id, ws in list(room_connections[room_id].items()):
+                try:
+                    await ws.send_json(message_data)
+                except Exception as e:
+                    print(f"[WARN] send to room member {member_id} failed: {e}")
+                    # Remove dead connection
+                    try:
+                        del room_connections[room_id][member_id]
+                    except Exception:
+                        pass
+            
+            # If room is empty, remove it
+            if not room_connections[room_id]:
+                del room_connections[room_id]
+    
+    except WebSocketDisconnect:
+        print(f"[ROOM WS DISCONNECT] {user_id} -> room {room_id}")
+        try:
+            if room_id in room_connections and user_id in room_connections[room_id]:
+                del room_connections[room_id][user_id]
+                if not room_connections[room_id]:
+                    del room_connections[room_id]
+        except Exception as e:
+            print(f"[ERROR] cleaning room connections after disconnect: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+    except Exception as exc:
+        print(f"[ERROR] room_websocket_endpoint exception {user_id}->room {room_id}: {exc}")
+        try:
+            if room_id in room_connections and user_id in room_connections[room_id]:
+                del room_connections[room_id][user_id]
+                if not room_connections[room_id]:
+                    del room_connections[room_id]
+        except Exception as e:
+            print(f"[ERROR] cleanup after exception: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
